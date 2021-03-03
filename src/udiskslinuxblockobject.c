@@ -114,12 +114,9 @@ enum
 
 G_DEFINE_TYPE (UDisksLinuxBlockObject, udisks_linux_block_object, UDISKS_TYPE_OBJECT_SKELETON);
 
-static void on_mount_monitor_mount_added   (UDisksMountMonitor  *monitor,
-                                            UDisksMount         *mount,
-                                            gpointer             user_data);
-static void on_mount_monitor_mount_removed (UDisksMountMonitor  *monitor,
-                                            UDisksMount         *mount,
-                                            gpointer             user_data);
+static void on_mount_monitor_mount_added_removed (UDisksMountMonitor  *monitor,
+                                                  UDisksMount         *mount,
+                                                  gpointer             user_data);
 
 static void
 udisks_linux_block_object_finalize (GObject *_object)
@@ -127,8 +124,7 @@ udisks_linux_block_object_finalize (GObject *_object)
   UDisksLinuxBlockObject *object = UDISKS_LINUX_BLOCK_OBJECT (_object);
 
   /* note: we don't hold a ref to block->daemon or block->mount_monitor */
-  g_signal_handlers_disconnect_by_func (object->mount_monitor, on_mount_monitor_mount_added, object);
-  g_signal_handlers_disconnect_by_func (object->mount_monitor, on_mount_monitor_mount_removed, object);
+  g_signal_handlers_disconnect_by_func (object->mount_monitor, on_mount_monitor_mount_added_removed, object);
 
   g_object_unref (object->device);
   g_mutex_clear (&object->device_mutex);
@@ -229,11 +225,11 @@ udisks_linux_block_object_constructed (GObject *_object)
   object->mount_monitor = udisks_daemon_get_mount_monitor (object->daemon);
   g_signal_connect (object->mount_monitor,
                     "mount-added",
-                    G_CALLBACK (on_mount_monitor_mount_added),
+                    G_CALLBACK (on_mount_monitor_mount_added_removed),
                     object);
   g_signal_connect (object->mount_monitor,
                     "mount-removed",
-                    G_CALLBACK (on_mount_monitor_mount_removed),
+                    G_CALLBACK (on_mount_monitor_mount_added_removed),
                     object);
 
   /* initial coldplug */
@@ -936,22 +932,30 @@ udisks_linux_block_object_uevent (UDisksLinuxBlockObject *object,
 /* ---------------------------------------------------------------------------------------------------- */
 
 static void
-on_mount_monitor_mount_added (UDisksMountMonitor  *monitor,
-                              UDisksMount         *mount,
-                              gpointer             user_data)
+on_mount_monitor_mount_added_removed (UDisksMountMonitor  *monitor,
+                                      UDisksMount         *mount,
+                                      gpointer             user_data)
 {
   UDisksLinuxBlockObject *object = UDISKS_LINUX_BLOCK_OBJECT (user_data);
-  if (udisks_mount_get_dev (mount) == g_udev_device_get_device_number (object->device->udev_device))
-    udisks_linux_block_object_uevent (object, NULL, NULL);
-}
+  UDisksFilesystem *fs;
+  gboolean related;
 
-static void
-on_mount_monitor_mount_removed (UDisksMountMonitor  *monitor,
-                                UDisksMount         *mount,
-                                gpointer             user_data)
-{
-  UDisksLinuxBlockObject *object = UDISKS_LINUX_BLOCK_OBJECT (user_data);
-  if (udisks_mount_get_dev (mount) == g_udev_device_get_device_number (object->device->udev_device))
+  if (udisks_mount_get_mount_type (mount) != UDISKS_MOUNT_TYPE_FILESYSTEM)
+    return;
+
+  related = udisks_mount_get_dev (mount) == g_udev_device_get_device_number (object->device->udev_device);
+  if (!related && udisks_mount_get_fs_uuid (mount) != NULL)
+    {
+      fs = udisks_object_peek_filesystem (UDISKS_OBJECT (object));
+      if (fs != NULL)
+        {
+          /* Assume identification by filesystem UUID */
+          if (udisks_linux_filesystem_is_volume_based (UDISKS_LINUX_FILESYSTEM (fs), object))
+            related = g_strcmp0 (g_udev_device_get_property (object->device->udev_device, "ID_FS_UUID"), udisks_mount_get_fs_uuid (mount)) == 0;
+        }
+    }
+
+  if (related)
     udisks_linux_block_object_uevent (object, NULL, NULL);
 }
 

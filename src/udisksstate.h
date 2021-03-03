@@ -35,18 +35,19 @@ UDisksDaemon  *udisks_state_get_daemon           (UDisksState   *state);
 void           udisks_state_start_cleanup        (UDisksState   *state);
 void           udisks_state_stop_cleanup         (UDisksState   *state);
 void           udisks_state_check                (UDisksState   *state);
-void           udisks_state_check_sync           (UDisksState   *state);
 void           udisks_state_check_block          (UDisksState   *state,
                                                   dev_t          block_device);
 /* mounted-fs */
 void           udisks_state_add_mounted_fs       (UDisksState   *state,
                                                   const gchar   *mount_point,
                                                   dev_t          block_device,
+                                                  const gchar   *fs_uuid,
                                                   uid_t          uid,
                                                   gboolean       fstab_mount,
                                                   gboolean       persistent);
 gchar         *udisks_state_find_mounted_fs      (UDisksState   *state,
                                                   dev_t          block_device,
+                                                  const gchar   *fs_uuid,
                                                   uid_t         *out_uid,
                                                   gboolean      *out_fstab_mount);
 /* unlocked-crypto-dev */
