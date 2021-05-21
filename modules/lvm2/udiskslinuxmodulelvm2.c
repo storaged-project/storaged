@@ -24,6 +24,7 @@
 #include <blockdev/lvm.h>
 
 #include <src/udisksdaemon.h>
+#include <src/udiskslinuxprovider.h>
 #include <src/udiskslogging.h>
 #include <src/udiskslinuxdevice.h>
 #include <src/udisksmodulemanager.h>
@@ -57,8 +58,10 @@ struct _UDisksLinuxModuleLVM2 {
   /* maps from volume group name to UDisksLinuxVolumeGroupObject instances. */
   GHashTable *name_to_volume_group;
 
-  gint delayed_update_id;
-  gboolean coldplug_done;
+  gint64 last_update_requested;
+  GTask *update_task;
+
+  gboolean scalable_mode;
 };
 
 typedef struct _UDisksLinuxModuleLVM2Class UDisksLinuxModuleLVM2Class;
@@ -85,7 +88,8 @@ udisks_linux_module_lvm2_constructed (GObject *object)
   UDisksLinuxModuleLVM2 *module = UDISKS_LINUX_MODULE_LVM2 (object);
 
   module->name_to_volume_group = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_object_unref);
-  module->coldplug_done = FALSE;
+  module->last_update_requested = 0;
+  module->scalable_mode = FALSE;
 
   if (G_OBJECT_CLASS (udisks_linux_module_lvm2_parent_class)->constructed)
     G_OBJECT_CLASS (udisks_linux_module_lvm2_parent_class)->constructed (object);
@@ -95,6 +99,8 @@ static void
 udisks_linux_module_lvm2_finalize (GObject *object)
 {
   UDisksLinuxModuleLVM2 *module = UDISKS_LINUX_MODULE_LVM2 (object);
+
+  /* Note: won't be called until module->update_task finishes */
 
   g_hash_table_unref (module->name_to_volume_group);
 
@@ -202,6 +208,13 @@ udisks_linux_module_lvm2_new_manager (UDisksModule *module)
 
 /* ---------------------------------------------------------------------------------------------------- */
 
+typedef struct {
+  gint64 task_timestamp;
+  gboolean sync_task;
+} LVMUpdateTaskData;
+
+static gboolean delayed_lvm_update (gpointer user_data);
+
 static void
 lvm_update_vgs (GObject      *source_obj,
                 GAsyncResult *result,
@@ -214,12 +227,22 @@ lvm_update_vgs (GObject      *source_obj,
   GTask *task = G_TASK (result);
   GError *error = NULL;
   VGsPVsData *data = g_task_propagate_pointer (task, &error);
+  LVMUpdateTaskData *task_data = user_data;
   BDLVMVGdata **vgs, **vgs_p;
   BDLVMPVdata **pvs, **pvs_p;
 
   GHashTableIter vg_name_iter;
   gpointer key, value;
   const gchar *vg_name;
+  gint64 task_timestamp;
+  gboolean sync_task;
+  guint lv_count = 0;
+
+  g_warn_if_fail (task_data != NULL);
+
+  task_timestamp = task_data->task_timestamp;
+  sync_task = task_data->sync_task;
+  g_free (task_data);
 
   if (! data)
     {
@@ -233,6 +256,10 @@ lvm_update_vgs (GObject      *source_obj,
           /* this should never happen */
           udisks_warning ("LVM2 plugin: failure but no error when getting VGs!");
         }
+      g_clear_object (&module->update_task);
+      /* queue new task if a new uevent has been received during the task processing time */
+      if (!sync_task && task_timestamp < module->last_update_requested)
+        g_idle_add (delayed_lvm_update, module);
       return;
     }
   vgs = data->vgs;
@@ -283,7 +310,20 @@ lvm_update_vgs (GObject      *source_obj,
         if (g_strcmp0 ((*pvs_p)->vg_name, vg_name) == 0)
             vg_pvs = g_slist_prepend (vg_pvs, bd_lvm_pvdata_copy (*pvs_p));
 
-      udisks_linux_volume_group_object_update (group, *vgs_p, vg_pvs);
+      udisks_linux_volume_group_object_update (group, *vgs_p, vg_pvs, sync_task);
+      lv_count += udisks_linux_volume_group_object_get_lv_count (group);
+    }
+
+  if (lv_count > LVM2_SCALABLE_MODE_THRESHOLD)
+    {
+      if (! module->scalable_mode)
+        udisks_warning ("lvm2: Total of %u logical volumes detected in the system, switching the scalable mode on.", lv_count);
+      module->scalable_mode = TRUE;
+    }
+  else
+    {
+      /* stepping down from scalable mode is currently allowed */
+      module->scalable_mode = FALSE;
     }
 
   /* UDisksLinuxVolumeGroupObject carries copies of BDLVMPVdata that belong to the VG.
@@ -296,22 +336,65 @@ lvm_update_vgs (GObject      *source_obj,
   /* only free the containers, the contents were passed further */
   g_free (vgs);
   g_free (pvs);
+
+  /* we hold a reference to the task */
+  g_clear_object (&module->update_task);
+
+  /* If this update was sync, it was blocking the main (uevent processing) thread and
+   * there was no chance the module->last_update_requested timestamp would change. */
+  if (!sync_task && task_timestamp < module->last_update_requested)
+    {
+      /* Further uevents have been received while the update task was running,
+       * queue a new update. */
+      g_idle_add (delayed_lvm_update, module);
+    }
 }
 
 static void
-lvm_update (UDisksLinuxModuleLVM2 *module)
+lvm_update (UDisksLinuxModuleLVM2 *module, gint64 timestamp, gboolean coldplug, gboolean force_update)
 {
-  GTask *task;
+  UDisksDaemon *daemon;
+  UDisksLinuxProvider *provider;
+  LVMUpdateTaskData *task_data;
+
+  daemon = udisks_module_get_daemon (UDISKS_MODULE (module));
+  provider = udisks_daemon_get_linux_provider (daemon);
+
+  if (!force_update && udisks_linux_provider_get_last_uevent (provider) <= module->last_update_requested)
+    {
+      udisks_debug ("lvm2: no uevent received since last update, skipping");
+      return;
+    }
+
+  /* store timestamp of a last update requested */
+  module->last_update_requested = timestamp;
+  if (module->update_task)
+    {
+      udisks_debug ("lvm2: update already in progress, will queue another one once finished");
+      return;
+    }
+
+  task_data = g_new0 (LVMUpdateTaskData, 1);
+  task_data->task_timestamp = module->last_update_requested;
 
   /* the callback (lvm_update_vgs) is called in the default main loop (context) */
-  task = g_task_new (module,
-                     NULL /* cancellable */,
-                     lvm_update_vgs,
-                     NULL /* callback_data */);
+  module->update_task = g_task_new (module,
+                                    NULL /* cancellable */,
+                                    lvm_update_vgs,
+                                    task_data /* callback_data */);
 
-  /* holds a reference to 'task' until it is finished */
-  g_task_run_in_thread (task, (GTaskThreadFunc) vgs_task_func);
-  g_object_unref (task);
+  /* the callback is responsible for releasing the task reference */
+  if (coldplug || !module->scalable_mode)
+    {
+      task_data->sync_task = TRUE;
+      g_task_run_in_thread_sync (module->update_task, (GTaskThreadFunc) vgs_task_func);
+      lvm_update_vgs (G_OBJECT (module), G_ASYNC_RESULT (module->update_task), task_data);
+    }
+  else
+    {
+      task_data->sync_task = FALSE;
+      g_task_run_in_thread (module->update_task, (GTaskThreadFunc) vgs_task_func);
+    }
 }
 
 static gboolean
@@ -319,32 +402,28 @@ delayed_lvm_update (gpointer user_data)
 {
   UDisksLinuxModuleLVM2 *module = UDISKS_LINUX_MODULE_LVM2 (user_data);
 
-  lvm_update (module);
-  module->delayed_update_id = 0;
+  udisks_debug ("lvm2: spawning another update due to incoming uevent during last update");
+
+  /* delayed updates are always async */
+  lvm_update (module, g_get_monotonic_time (), FALSE, TRUE);
 
   return FALSE;
 }
 
 static void
-trigger_delayed_lvm_update (UDisksLinuxModuleLVM2 *module)
+trigger_delayed_lvm_update (UDisksLinuxModuleLVM2 *module, gint64 timestamp)
 {
-  if (module->delayed_update_id > 0)
-    return;
+  UDisksDaemon *daemon;
+  UDisksLinuxProvider *provider;
+  gboolean coldplug;
 
-  if (! module->coldplug_done)
-    {
-      /* Update immediately when doing coldplug, i.e. when lvm2 module has just
-       * been activated. This is not 100% effective as this affects only the
-       * first request but from the plugin nature we don't know whether
-       * coldplugging has been finished or not. Might be subject to change in
-       * the future. */
-      module->coldplug_done = TRUE;
-      lvm_update (module);
-    }
-  else
-    {
-      module->delayed_update_id = g_timeout_add (100, delayed_lvm_update, module);
-    }
+  daemon = udisks_module_get_daemon (UDISKS_MODULE (module));
+  provider = udisks_daemon_get_linux_provider (daemon);
+
+  coldplug = udisks_linux_provider_get_coldplug (provider) ||
+             udisks_linux_provider_get_modules_coldplug (provider);
+
+  lvm_update (module, timestamp, coldplug, FALSE);
 }
 
 static gboolean
@@ -381,6 +460,7 @@ is_recorded_as_physical_volume (UDisksLinuxModuleLVM2 *module,
   return ret;
 }
 
+/* should only be called from the main thread */
 static GDBusObjectSkeleton **
 udisks_linux_module_lvm2_new_object (UDisksModule      *module,
                                      UDisksLinuxDevice *device)
@@ -397,7 +477,7 @@ udisks_linux_module_lvm2_new_object (UDisksModule      *module,
   if (is_logical_volume (device)
       || has_physical_volume_label (device)
       || is_recorded_as_physical_volume (UDISKS_LINUX_MODULE_LVM2 (module), device))
-    trigger_delayed_lvm_update (UDISKS_LINUX_MODULE_LVM2 (module));
+    trigger_delayed_lvm_update (UDISKS_LINUX_MODULE_LVM2 (module), device->timestamp);
 
   return NULL;
 }

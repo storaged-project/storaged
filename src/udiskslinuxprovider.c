@@ -64,6 +64,7 @@ struct _UDisksLinuxProvider
   GUdevClient *gudev_client;
   GAsyncQueue *probe_request_queue;
   GThread *probe_request_thread;
+  gint64 last_uevent_timestamp;
 
   UDisksObjectSkeleton *manager_object;
 
@@ -90,6 +91,7 @@ struct _UDisksLinuxProvider
 
   /* set to TRUE only in the coldplug phase */
   gboolean coldplug;
+  gboolean modules_coldplug;
 
   guint housekeeping_timeout;
   guint64 housekeeping_last;
@@ -222,6 +224,7 @@ typedef struct
   UDisksLinuxProvider *provider;
   GUdevDevice *udev_device;
   UDisksLinuxDevice *udisks_device;
+  gint64 timestamp;
 } ProbeRequest;
 
 static void
@@ -290,7 +293,8 @@ probe_request_thread_func (gpointer user_data)
       }
 
       /* probe the device - this may take a while */
-      request->udisks_device = udisks_linux_device_new_sync (request->udev_device);
+      request->udisks_device = udisks_linux_device_new_sync (request->udev_device,
+                                                             request->timestamp);
 
       /* now that we've probed the device, post the request back to the main thread */
       g_idle_add (on_idle_with_probed_uevent, request);
@@ -311,8 +315,13 @@ on_uevent (GUdevClient  *client,
 {
   UDisksLinuxProvider *provider = UDISKS_LINUX_PROVIDER (user_data);
   ProbeRequest *request;
+  gint64 timestamp;
+
+  timestamp = g_get_monotonic_time ();
+  provider->last_uevent_timestamp = timestamp;
 
   request = g_slice_new0 (ProbeRequest);
+  request->timestamp = timestamp;
   request->provider = g_object_ref (provider);
   request->udev_device = g_object_ref (device);
 
@@ -342,6 +351,7 @@ udisks_linux_provider_constructed (GObject *object)
 
   /* get ourselves an udev client */
   provider->gudev_client = g_udev_client_new (subsystems);
+  provider->last_uevent_timestamp = g_get_monotonic_time ();
 
   g_signal_connect (provider->gudev_client,
                     "uevent",
@@ -483,7 +493,9 @@ get_udisks_devices (UDisksLinuxProvider *provider)
   GList *devices;
   GList *udisks_devices;
   GList *l;
+  gint64 timestamp;
 
+  timestamp = g_get_monotonic_time ();
   devices = g_udev_client_query_by_subsystem (provider->gudev_client, "block");
 
   /* make sure we process sda before sdz and sdz before sdaa */
@@ -495,7 +507,7 @@ get_udisks_devices (UDisksLinuxProvider *provider)
       GUdevDevice *device = G_UDEV_DEVICE (l->data);
       if (!g_udev_device_get_is_initialized (device))
         continue;
-      udisks_devices = g_list_prepend (udisks_devices, udisks_linux_device_new_sync (device));
+      udisks_devices = g_list_prepend (udisks_devices, udisks_linux_device_new_sync (device, timestamp));
     }
   udisks_devices = g_list_reverse (udisks_devices);
   g_list_free_full (devices, g_object_unref);
@@ -576,11 +588,13 @@ ensure_modules (UDisksLinuxProvider *provider)
     }
 
   /* Perform coldplug */
-  udisks_debug ("Performing coldplug...");
+  udisks_debug ("Performing secondary/modules coldplug...");
   udisks_devices = get_udisks_devices (provider);
+  provider->modules_coldplug = TRUE;
   do_coldplug (provider, udisks_devices);
+  provider->modules_coldplug = FALSE;
   g_list_free_full (udisks_devices, g_object_unref);
-  udisks_debug ("Coldplug complete");
+  udisks_debug ("Secondary/modules coldplug complete");
 }
 
 /*
@@ -849,6 +863,40 @@ udisks_linux_provider_get_coldplug (UDisksLinuxProvider *provider)
 {
   g_return_val_if_fail (UDISKS_IS_LINUX_PROVIDER (provider), FALSE);
   return provider->coldplug;
+}
+
+/**
+ * udisks_linux_provider_get_modules_coldplug:
+ * @provider: A #UDisksLinuxProvider.
+ *
+ * Gets whether @provider is in the secondary coldplug phase as a result
+ * of module(s) being activated. This "modules coldplug" phase is intended
+ * for synchronous additional module interfaces initialization over
+ * an already initialized (coldplugged) base drive or block object.
+ *
+ * Returns: %TRUE if in the secondary coldplug phase, %FALSE otherwise.
+ **/
+gboolean
+udisks_linux_provider_get_modules_coldplug (UDisksLinuxProvider *provider)
+{
+  g_return_val_if_fail (UDISKS_IS_LINUX_PROVIDER (provider), FALSE);
+  return provider->modules_coldplug;
+}
+
+/**
+ * udisks_linux_provider_get_last_uevent:
+ * @provider: A #UDisksLinuxProvider.
+ *
+ * Gets timestamp of a last uevent received.
+ *
+ * Returns: monotonic time of a last uevent.
+ **/
+gint64
+udisks_linux_provider_get_last_uevent (UDisksLinuxProvider *provider)
+{
+  g_return_val_if_fail (UDISKS_IS_LINUX_PROVIDER (provider), 0);
+  /* TODO: do we need to assure atomicity? */
+  return provider->last_uevent_timestamp;
 }
 
 /* ---------------------------------------------------------------------------------------------------- */
@@ -1339,6 +1387,7 @@ handle_block_uevent (UDisksLinuxProvider *provider,
       handle_block_uevent_for_block (provider, action, device);
       handle_block_uevent_for_drive (provider, action, device);
       handle_block_uevent_for_mdraid (provider, action, device);
+      /* TODO: implement two-phase pre-remove and post-remove modules callback */
       handle_block_uevent_for_modules (provider, action, device);
     }
   else
@@ -1356,10 +1405,11 @@ handle_block_uevent (UDisksLinuxProvider *provider,
         }
       else
         {
-          handle_block_uevent_for_modules (provider, action, device);
           handle_block_uevent_for_mdraid (provider, action, device);
           handle_block_uevent_for_drive (provider, action, device);
           handle_block_uevent_for_block (provider, action, device);
+          /* TODO: implement two-phase pre-add and post-add modules callback */
+          handle_block_uevent_for_modules (provider, action, device);
         }
     }
 
